@@ -243,7 +243,7 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
         upstreamResponse.pipe(res);
       });
       // Other routes are passed through once. Responses retries only explicit
-      // rate-limit rejections before any normal SSE event is committed.
+      // rate-limit rejections before output/tool events are committed.
       upstreamRequest.setTimeout(600000, () => upstreamRequest.destroy(new Error('upstream_timeout')));
       upstreamRequest.on('error', error => {
         if (res.destroyed) return;

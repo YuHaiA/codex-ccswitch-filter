@@ -81,14 +81,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\ccswitch-filter.ps1 Panel
 
 ## 限流等待重试
 
-- 识别 Responses HTTP 429、明确包含限流错误的其他 HTTP 响应，以及流开始前的限流错误事件，包括被代理包装成 502 的限流。
+- 所有经本过滤层的 Responses 模型使用相同规则，模型名和 Azure 区域名不参与限流判断。
+- 识别 Responses HTTP 429，以及包含限流提示的 HTTP / JSON 错误，包括代理包装成 502 的顶层 `message`、`code` 和嵌套错误。正常模型输出提到“限流”不会触发重试。
+- 流式请求在实际输出或工具事件之前检查限流；支持 `response.created` / `response.in_progress` 后的错误，以及 gzip、deflate、br、zstd 压缩 SSE。等待流首结果时发送保活信号，不因旧的五秒检查窗口到期而漏判。
 - 每个请求最多自动重试 50 次，加上初次请求共最多 51 次。
 - 优先使用 `Retry-After`、`retry-after-ms`、`x-ms-retry-after-ms` 或额度为零时的 `x-ratelimit-reset-*` 等等待提示。
 - 没有可用提示时，按约 5、10、20、40、60 秒逐步退避，并加入少量随机间隔。持续限流可能等待约 47 分钟或更久。
 - 流式等待期间发送 SSE 注释保活；在 Codex 点停止或断开连接会取消等待及后续重试。
-- 已转发普通流事件（如 `response.created`、输出或工具事件）后不再重放请求。余额不足、鉴权失败、普通网络断开与普通 5xx 不自动重试。
+- 在实际输出之前缓冲空的创建 / 进行中元数据，限流重试时丢弃失败尝试的元数据，不向客户端混入不同响应 ID。看到输出、推理、工具或未知事件后立即转发，不再重放请求。余额不足、鉴权失败、普通网络断开与普通 5xx 不自动重试。
 
 重试只能等待上游额度恢复，无法提高账号或 Azure 资源配额。耗尽次数后保留最后一次错误。可在状态中查看 `rateLimitMaxRetries` 与 `stats.rateLimitRetries`、`pendingRateLimitRetries`、`rateLimitRecoveries`、`rateLimitExhausted`。
+
+这些计数属于过滤层。Codex 显示的 `Reconnecting 2/5` 等属于客户端自己的重连，不代表过滤层已经执行 50 次重试；是否进入本工具的重试，以计数和 `rate-limit-retry` 日志为准。仅支持本页说明的 Responses HTTP / SSE，不覆盖绕过本工具的请求或其他 API 路由。
 
 ## 接管边界
 

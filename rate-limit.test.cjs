@@ -6,7 +6,7 @@ const http = require('node:http');
 const zlib = require('node:zlib');
 const {once} = require('node:events');
 const {makeProxy, ADMIN} = require('./proxy.cjs');
-const {DEFAULT_POLICY, retryDelay} = require('./rate-limit.cjs');
+const {DEFAULT_POLICY, retryDelay, isRateLimit} = require('./rate-limit.cjs');
 
 const fastPolicy = {baseDelayMs: 1, maxDelayMs: 1, minDelayMs: 1, random: () => 0, sniffTimeoutMs: 100};
 const payload = {model: 'mock', input: 'hello', store: true};
@@ -98,13 +98,14 @@ test('wrapped 502 rate-limit error retries, billing errors and unrelated failure
   }
 });
 
-test('first SSE rate-limit event retries, then preserves normal output without replaying after response.created', async t => {
+test('first SSE rate-limit event retries, then preserves normal output without replaying after output', async t => {
   const counts = new Map();
   const {call, health} = await setup(t, (req, res) => {
     req.resume(); const count = (counts.get(req.url) || 0) + 1; counts.set(req.url, count);
     res.writeHead(200, {'content-type': 'text/event-stream'});
     if (req.url.endsWith('late')) {
-      res.end('event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}\n\n'
+      res.end('event: response.created\ndata: {"type":"response.created","response":{"id":"r1","output":[]}}\n\n'
+        + 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"already sent"}\n\n'
         + 'event: error\ndata: ' + JSON.stringify({type: 'error', ...azureError}) + '\n\n');
     } else if (count === 1) {
       // An initial comment and split error frame must also be recognized.
@@ -120,6 +121,95 @@ test('first SSE rate-limit event retries, then preserves normal output without r
   assert.equal((await health()).stats.rateLimitRecoveries, 1);
   const late = await call({...payload, stream: true}, '/responses?late');
   assert.match(await late.text(), /exceeded token rate limit/); assert.equal(counts.get('/responses?late'), 1);
+});
+
+test('model-independent HTTP detection covers top-level, nested, plain text and JSON error envelopes', async t => {
+  const counts = new Map();
+  const formats = {
+    'azure-502': {status: 502, body: JSON.stringify({message: 'rate limit exceeded: Your requests to gpt-6.1-sol in eastus2 have exceeded token rate limit.'})},
+    'nested-200': {status: 200, body: JSON.stringify({data: {error: {type: 'rate_limit_error', message: 'Too many requests for any-model'}}})},
+    'code-200': {status: 200, body: JSON.stringify({code: 'rate_limit_exceeded', message: 'Any model is throttled.'})},
+    'text-503': {status: 503, type: 'text/plain', body: 'Token rate limit exceeded for another-model'},
+    'problem-json': {status: 200, type: 'application/problem+json', body: JSON.stringify({error: {message: 'rate_limit_exceeded'}})}
+  };
+  const {call, health} = await setup(t, (req, res) => {
+    req.resume(); const key = req.url.split('?')[1];
+    const count = (counts.get(key) || 0) + 1; counts.set(key, count);
+    const format = formats[key];
+    res.writeHead(count === 1 ? format.status : 200, {'content-type': format.type || 'application/json'});
+    res.end(count === 1 ? format.body : JSON.stringify({ok: true}));
+  });
+  for (const key of Object.keys(formats)) {
+    assert.deepEqual(await (await call({...payload, model: key}, '/responses?' + key)).json(), {ok: true});
+    assert.equal(counts.get(key), 2);
+  }
+  assert.equal((await health()).stats.rateLimitRecoveries, 5);
+});
+
+test('compressed SSE prelude can be discarded and retried before output, without leaking rejected response IDs', async t => {
+  const counts = new Map();
+  const encode = {gzip: zlib.gzipSync, deflate: zlib.deflateSync, br: zlib.brotliCompressSync, zstd: zlib.zstdCompressSync};
+  const {call, health} = await setup(t, (req, res) => {
+    req.resume(); const encoding = req.url.split('?')[1];
+    const count = (counts.get(encoding) || 0) + 1; counts.set(encoding, count);
+    const id = count === 1 ? 'rejected-id' : 'accepted-id';
+    const prelude = 'event: response.created\ndata: ' + JSON.stringify({type:'response.created', response:{id, output:[]}}) + '\n\n'
+      + 'event: response.in_progress\ndata: ' + JSON.stringify({type:'response.in_progress', response:{id, output:[]}}) + '\n\n';
+    const text = prelude + (count === 1
+      ? 'event: error\ndata: ' + JSON.stringify({message:'rate limit exceeded: any model is throttled'}) + '\n\n'
+      : 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"recovered"}\n\n');
+    res.writeHead(200, {'content-type':'text/event-stream', 'content-encoding':encoding});
+    res.end(encode[encoding](Buffer.from(text)));
+  });
+  for (const encoding of Object.keys(encode)) {
+    const response = await call({...payload, stream:true}, '/responses?' + encoding);
+    const text = await response.text();
+    assert.equal(response.headers.get('content-encoding'), null);
+    assert.match(text, /accepted-id/); assert.match(text, /recovered/);
+    assert.doesNotMatch(text, /rejected-id|rate limit exceeded/);
+    assert.equal(counts.get(encoding), 2);
+  }
+  assert.equal((await health()).stats.rateLimitRecoveries, 4);
+});
+
+test('SSE error arriving after the old sniff timeout is retried; split prelude is preserved only on recovery', async t => {
+  let attempts = 0;
+  const {call} = await setup(t, (req, res) => {
+    req.resume(); attempts++;
+    res.writeHead(200, {'content-type':'text/event-stream', 'content-encoding':'identity'});
+    res.write(': heartbeat\n\nevent: response.created\ndata: {"type":"response.created","response":{"id":"');
+    res.write(attempts === 1 ? 'reject' : 'accept');
+    res.write('","output":[]}}\n\n');
+    if (attempts === 1) setTimeout(() => res.end('event: error\ndata: ' + JSON.stringify({type:'error', ...azureError}) + '\n\n'), 35);
+    else res.end('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n');
+  }, {...fastPolicy, sniffTimeoutMs:5});
+  const text = await (await call({...payload, stream:true})).text();
+  assert.equal(attempts, 2); assert.match(text, /accept/); assert.doesNotMatch(text, /reject|exceeded token rate limit/);
+});
+
+test('normal output mentioning rate limits and real tool execution are never replayed', async t => {
+  const counts = new Map();
+  const {call} = await setup(t, (req, res) => {
+    req.resume(); const key = req.url.split('?')[1]; counts.set(key, (counts.get(key) || 0) + 1);
+    if (key === 'json') {
+      res.writeHead(200, {'content-type':'application/json'});
+      return res.end(JSON.stringify({id:'ok', output:[{content:[{text:'rate_limit_exceeded means too many requests'}]}]}));
+    }
+    res.writeHead(200, {'content-type':'text/event-stream'});
+    res.end('event: response.created\ndata: {"type":"response.created","response":{"id":"tool","output":[]}}\n\n'
+      + 'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1"}}\n\n'
+      + 'event: error\ndata: ' + JSON.stringify({type:'error', ...azureError}) + '\n\n');
+  });
+  assert.match(await (await call(payload, '/responses?json')).text(), /rate_limit_exceeded/);
+  assert.match(await (await call({...payload, stream:true}, '/responses?tool')).text(), /call-1/);
+  assert.deepEqual([...counts.values()], [1, 1]);
+});
+
+test('generic classification still excludes authentication and billing errors', () => {
+  assert.equal(isRateLimit({type:'throttling_error', message:'slow down'}, 503), true);
+  assert.equal(isRateLimit('rate limit exceeded for model-that-did-not-exist-in-tests', 502), true);
+  assert.equal(isRateLimit({code:'invalid_api_key', message:'rate limit exceeded'}, 502), false);
+  assert.equal(isRateLimit({error:{code:'insufficient_quota', message:'too many requests'}}, 429), false);
 });
 
 test('streaming retries exhausted on HTTP rejection return an SSE error, never mixed JSON', async t => {
