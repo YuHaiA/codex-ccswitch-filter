@@ -6,12 +6,14 @@ const http = require('node:http');
 const zlib = require('node:zlib');
 const {once} = require('node:events');
 const {makeProxy, ADMIN} = require('./proxy.cjs');
-const {DEFAULT_POLICY, retryDelay, isRateLimit} = require('./rate-limit.cjs');
+const {DEFAULT_POLICY, retryDelay, isRateLimit, isStreamDisconnect} = require('./rate-limit.cjs');
 
 const fastPolicy = {baseDelayMs: 1, maxDelayMs: 1, minDelayMs: 1, random: () => 0, sniffTimeoutMs: 100};
 const payload = {model: 'mock', input: 'hello', store: true};
 const azureError = {code: 'rate_limit_exceeded', message:
   'Your requests to gpt-5.6-sol for gpt-5.6-sol in eastus2 have exceeded token rate limit.'};
+const disconnectError = {code: 'upstream_stream_disconnected', message:
+  'stream disconnected before completion: stream closed before response.completed'};
 
 async function setup(t, handler, retryPolicy = fastPolicy) {
   const upstream = http.createServer(handler);
@@ -269,4 +271,136 @@ test('non-Responses paths never retry even when upstream returns 429', async t =
     res.end(JSON.stringify({error: azureError}));
   });
   assert.equal((await call(payload, '/embeddings')).status, 429); assert.equal(attempts, 1);
+});
+
+test('stream disconnect errors retry in HTTP and SSE envelopes before output', async t => {
+  const counts = new Map();
+  const formats = {
+    json: {status: 502, body: JSON.stringify({error: disconnectError})},
+    text: {status: 502, type: 'text/plain', body: disconnectError.message},
+    nested: {status: 200, body: JSON.stringify({data: {error: disconnectError}})},
+    code: {status: 200, body: JSON.stringify(disconnectError)},
+    sse: {status: 200, type: 'text/event-stream', body:
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"discard","output":[]}}\n\n'
+      + 'event: response.failed\ndata: ' + JSON.stringify({type:'response.failed', response:{error:disconnectError}}) + '\n\n'},
+    raw: {status: 200, type: 'text/event-stream', body: 'event: error\ndata: ' + disconnectError.message + '\n\n'}
+  };
+  const recovered = 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"accepted","output":[]}}\n\n';
+  const {call, health} = await setup(t, (req, res) => {
+    req.resume(); const key = req.url.split('?')[1];
+    const count = (counts.get(key) || 0) + 1; counts.set(key, count);
+    const format = formats[key];
+    res.writeHead(count === 1 ? format.status : 200,
+      {'content-type': count === 1 ? format.type || 'application/json' : 'text/event-stream'});
+    res.end(count === 1 ? format.body : recovered);
+  });
+  for (const key of Object.keys(formats)) {
+    const text = await (await call({...payload, stream:true}, '/responses?' + key)).text();
+    assert.match(text, /^: stream-disconnect retry pending/);
+    assert.match(text, /accepted/); assert.doesNotMatch(text, /discard|stream closed before/);
+    assert.equal(counts.get(key), 2);
+  }
+  const {stats} = await health();
+  assert.equal(stats.streamDisconnectRecoveries, 6); assert.equal(stats.rateLimitRetries, 0);
+});
+
+test('empty or metadata-only SSE ending or aborting before completion retries without leaking IDs', async t => {
+  const counts = new Map();
+  const {call, health} = await setup(t, (req, res) => {
+    req.resume(); const key = req.url.split('?')[1];
+    const count = (counts.get(key) || 0) + 1; counts.set(key, count);
+    const prelude = 'event: response.created\ndata: {"type":"response.created","response":{"id":"discard","output":[]}}\n\n';
+    res.writeHead(200, {'content-type':'text/event-stream', ...(key === 'gzip' ? {'content-encoding':'gzip'} : {})});
+    if (count === 1) {
+      if (key === 'abort') { res.write(prelude); return setTimeout(() => res.destroy(), 10); }
+      return res.end(key === 'empty' ? '' : key === 'gzip' ? zlib.gzipSync(Buffer.from(prelude)) : prelude);
+    }
+    const completed = 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"accepted","output":[]}}\n\n';
+    res.end(key === 'gzip' ? zlib.gzipSync(Buffer.from(completed)) : completed);
+  });
+  for (const key of ['empty', 'end', 'abort', 'gzip']) {
+    const text = await (await call({...payload, stream:true}, '/responses?' + key)).text();
+    assert.match(text, /accepted/); assert.doesNotMatch(text, /discard|stream closed before/);
+    assert.equal(counts.get(key), 2);
+  }
+  assert.equal((await health()).stats.streamDisconnectRecoveries, 4);
+});
+
+test('disconnect text in generated content, committed streams, auth and billing failures never retries', async t => {
+  const counts = new Map();
+  const committed = {
+    text: {type:'response.output_text.delta', delta:'already sent'},
+    tool: {type:'response.output_item.added', item:{type:'function_call', call_id:'call-1'}},
+    reasoning: {type:'response.reasoning_summary_text.delta', delta:'thinking'},
+    unknown: {type:'custom.event', value:'committed'}
+  };
+  const {call} = await setup(t, (req, res) => {
+    req.resume(); const key = req.url.split('?')[1]; counts.set(key, (counts.get(key) || 0) + 1);
+    if (committed[key]) {
+      res.writeHead(200, {'content-type':'text/event-stream'});
+      return res.end('event: ' + committed[key].type + '\ndata: ' + JSON.stringify(committed[key]) + '\n\n'
+        + 'event: error\ndata: ' + JSON.stringify({type:'error', ...disconnectError}) + '\n\n');
+    }
+    if (key === 'completed') {
+      res.writeHead(200, {'content-type':'text/event-stream'});
+      return res.end('event: response.completed\ndata: {"type":"response.completed","response":{"output":[]}}\n\n');
+    }
+    res.writeHead(key === 'auth' ? 403 : key === 'billing' ? 429 : 200, {'content-type':'application/json'});
+    res.end(JSON.stringify(key === 'json' ? {output:[{content:[{text:disconnectError.message}]}]}
+      : {error:{...disconnectError, ...(key === 'billing' ? {code:'insufficient_quota'} : {})}}));
+  });
+  for (const key of [...Object.keys(committed), 'completed', 'json', 'auth', 'billing']) {
+    const text = await (await call({...payload, stream:true}, '/responses?' + key)).text();
+    assert.ok(text.length); assert.equal(counts.get(key), 1);
+  }
+  assert.equal(isRateLimit(disconnectError, 502), false);
+  assert.equal(isStreamDisconnect(disconnectError, 502), true);
+  assert.equal(isStreamDisconnect('socket hang up', 502), false);
+  assert.equal(isStreamDisconnect(disconnectError, 401), false);
+});
+
+test('mixed rate limit and disconnect failures share the 50-retry budget and preserve final error', {timeout:10000}, async t => {
+  let attempts = 0;
+  const {call, health} = await setup(t, (req, res) => {
+    req.resume(); attempts++;
+    res.writeHead(502, {'content-type':'application/json', 'x-final-error':'keep'});
+    res.end(JSON.stringify({error:attempts === 1 ? azureError : disconnectError}));
+  });
+  const response = await call();
+  assert.equal(response.status, 502); assert.equal(response.headers.get('x-final-error'), 'keep');
+  assert.deepEqual(await response.json(), {error:disconnectError}); assert.equal(attempts, 51);
+  const {stats} = await health();
+  assert.equal(stats.rateLimitRetries, 1); assert.equal(stats.streamDisconnectRetries, 49);
+  assert.equal(stats.streamDisconnectExhausted, 1); assert.equal(stats.streamDisconnectRecoveries, 0);
+});
+
+test('exhausted premature SSE ends return a real error instead of a false completion', async t => {
+  let attempts = 0;
+  const {call, health} = await setup(t, (req, res) => {
+    req.resume(); attempts++;
+    res.writeHead(200, {'content-type':'text/event-stream'}); res.end(': heartbeat\n\n');
+  }, {...fastPolicy, maxRetries:2});
+  const text = await (await call({...payload, stream:true})).text();
+  assert.match(text, /event: error\ndata: .*stream closed before response\.completed/);
+  assert.doesNotMatch(text, /event: response.completed/); assert.equal(attempts, 3);
+  const {stats} = await health();
+  assert.equal(stats.streamDisconnectExhausted, 1); assert.equal(stats.pendingStreamDisconnectRetries, 0);
+});
+
+test('client cancellation during disconnect cooldown prevents another request', {timeout:5000}, async t => {
+  let attempts = 0;
+  const {call, health} = await setup(t, (req, res) => {
+    req.resume(); attempts++; res.writeHead(502, {'content-type':'application/json', 'retry-after-ms':'1000'});
+    res.end(JSON.stringify({error:disconnectError}));
+  });
+  const controller = new AbortController();
+  const response = await call({...payload, stream:true}, '/responses', controller.signal);
+  const reader = response.body.getReader();
+  assert.match(Buffer.from((await reader.read()).value).toString(), /stream-disconnect retry pending/);
+  controller.abort(); await reader.cancel().catch(() => {});
+  for (let i = 0; i < 100 && (await health()).stats.activeResponsesRequests; i++)
+    await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(attempts, 1);
+  const {stats} = await health();
+  assert.equal(stats.pendingStreamDisconnectRetries, 0); assert.equal(stats.activeResponsesRequests, 0);
 });

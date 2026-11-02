@@ -46,7 +46,7 @@ function errorDetails(value, failure = false, depth = 0) {
   if (value.type === 'error' || /_error$/.test(value.type || '')) return value;
   // Some gateways put error code/message at the top level even with HTTP 200.
   // Never classify normal generated output by searching its full JSON text.
-  if (value.code != null && typeof value.message === 'string' && isRateLimit({code: value.code, message: value.message}))
+  if (value.code != null && typeof value.message === 'string' && retryKind({code: value.code, message: value.message}))
     return {code: value.code, message: value.message};
   for (const key of ['data', 'body', 'detail', 'details', 'cause', 'innererror', 'inner_error']) {
     if (!value[key] || typeof value[key] !== 'object') continue;
@@ -57,13 +57,36 @@ function errorDetails(value, failure = false, depth = 0) {
   return failure ? value : null;
 }
 
+function retryExcluded(text, status) {
+  return status === 401 || status === 403
+    || /authentication_error|invalid_api_key|unauthorized|permission_denied|access_denied/i.test(text)
+    || /insufficient[_ ]quota|billing[_ ]hard[_ ]limit|quota[_ ]exceeded|credit_balance_exhausted|(?:spend|usage)_limit_exceeded|credits? (?:exhausted|balance)|insufficient (?:funds|balance)|exceeded your current quota/i.test(text);
+}
+
 function isRateLimit(error, status) {
   const text = typeof error === 'string' ? error : JSON.stringify(error || {});
-  if (status === 401 || status === 403) return false;
-  if (/authentication_error|invalid_api_key|unauthorized|permission_denied|access_denied/i.test(text)) return false;
-  if (/insufficient[_ ]quota|billing[_ ]hard[_ ]limit|quota[_ ]exceeded|credit_balance_exhausted|(?:spend|usage)_limit_exceeded|credits? (?:exhausted|balance)|insufficient (?:funds|balance)|exceeded your current quota/i.test(text)) return false;
+  if (retryExcluded(text, status)) return false;
   return status === 429 || /rate[_ -]?limit(?:[_ -]exceeded|[_ -]error|[_ -]reached)?|token rate limit|too many requests|\bslow_down\b|\bthrottl(?:ed|ing)(?:_error)?\b/i.test(text);
 }
+
+function isStreamDisconnect(error, status) {
+  const text = typeof error === 'string' ? error : JSON.stringify(error || {});
+  return !retryExcluded(text, status) && /\bstream closed before response\.completed\b/i.test(text);
+}
+
+function retryKind(error, status) {
+  if (isRateLimit(error, status)) return 'rate-limit';
+  if (isStreamDisconnect(error, status)) return 'stream-disconnect';
+  return null;
+}
+
+function errorResult(error, status, reason) {
+  const kind = retryKind(error, status);
+  return {retry: !!kind, retryKind: kind, error, reason};
+}
+
+const STREAM_DISCONNECT_ERROR = Object.freeze({code: 'upstream_stream_disconnected',
+  message: 'stream disconnected before completion: stream closed before response.completed'});
 
 function decodeError(buffer, headers, limit) {
   const options = {maxOutputLength: limit};
@@ -127,7 +150,13 @@ function probe(response, policy, signal) {
       if (settled) return;
       settled = true; cleanup(); if (source !== response) source.destroy(); reject(error);
     };
-    const aborted = () => fail(new Error('upstream_response_aborted'));
+    const disconnected = () => ({...errorResult(STREAM_DISCONNECT_ERROR, status, 'stream-ended-before-completion'), syntheticError: true});
+    const aborted = () => {
+      if (!sse || status >= 400 || signal.aborted) return fail(new Error('upstream_response_aborted'));
+      // IncomingMessage emits an error after aborted; this attempt will be discarded.
+      response.once('error', () => {});
+      done(disconnected());
+    };
     const canceled = () => { fail(signal.reason); response.destroy(); };
     const frameResult = frame => {
       const lines = frame.split(/\r?\n/);
@@ -137,9 +166,9 @@ function probe(response, policy, signal) {
       const errorEvent = /^(?:error|rate_limit_error|response.failed)$/.test(event || '');
       let value;
       try { value = JSON.parse(payload); }
-      catch { return {retry: errorEvent && isRateLimit(payload, status), error: errorEvent ? payload : null, reason: 'unparsed-event'}; }
+      catch { return errorEvent ? errorResult(payload, status, 'unparsed-event') : {reason: 'unparsed-event'}; }
       const error = errorDetails(value, errorEvent || status >= 400);
-      if (error) return {retry: isRateLimit(error, status), error, reason: 'error-event'};
+      if (error) return errorResult(error, status, 'error-event');
       const type = value?.type || event;
       if (['response.created', 'response.in_progress'].includes(type)
           && value.response && Array.isArray(value.response.output) && value.response.output.length === 0
@@ -148,13 +177,14 @@ function probe(response, policy, signal) {
       return {reason: 'stream-committed'};
     };
     const end = () => {
-      if (sse) return done(frameResult(prefix.toString('utf8').slice(scanned)) || {reason: 'stream-ended'});
+      if (sse) return done(frameResult(prefix.toString('utf8').slice(scanned))
+        || (status < 400 ? disconnected() : {reason: 'stream-ended'}));
       const decoded = decodeError(prefix, headers, policy.maxErrorBytes);
       if (!decoded) return done({reason: 'undecodable-error'});
       let error;
       try { error = errorDetails(JSON.parse(decoded.toString('utf8')), status >= 400); }
       catch { error = status >= 400 ? decoded.toString('utf8') : null; }
-      done({retry: (status >= 400 || !!error) && isRateLimit(error, status), error, reason: 'http-body'});
+      done(errorResult(error, status, 'http-body'));
     };
     const data = chunk => {
       prefix = Buffer.concat([prefix, chunk]);
@@ -248,6 +278,7 @@ function pipeResponse(response, res, result, signal, cleanHeaders) {
 async function forwardResponses({getUpstream, path, headers, body, stream, res, signal, stats, log, shape, cleanHeaders, policy: overrides}) {
   const policy = {...DEFAULT_POLICY, ...overrides};
   let retries = 0, heartbeat;
+  const retriedKinds = new Set();
   stats.activeResponsesRequests++;
   const keepAlive = () => {
     if (!stream || res.destroyed || res.writableEnded) return;
@@ -271,42 +302,50 @@ async function forwardResponses({getUpstream, path, headers, body, stream, res, 
       if (['probe-timeout', 'probe-byte-limit', 'unsupported-encoding', 'undecodable-error'].includes(result.reason))
         log('rate-limit-probe-bypassed', {reason: result.reason, status: response.statusCode});
       if (result.retry) {
-        stats.rateLimitErrors++;
+        const kind = result.retryKind;
+        const statPrefix = kind === 'stream-disconnect' ? 'streamDisconnect' : 'rateLimit';
+        stats[statPrefix + 'Errors']++;
         if (retries < policy.maxRetries) {
           const delayMs = retryDelay(response.headers, retries + 1, policy);
           response.destroy();
           if (result.source !== response) result.source.destroy();
           retries++;
-          stats.rateLimitRetries++;
-          stats.pendingRateLimitRetries++;
-          log('rate-limit-retry', {retry: retries, maxRetries: policy.maxRetries, delayMs, status: response.statusCode, detectedBy: result.reason});
+          retriedKinds.add(kind);
+          stats[statPrefix + 'Retries']++;
+          const pendingStat = kind === 'stream-disconnect' ? 'pendingStreamDisconnectRetries' : 'pendingRateLimitRetries';
+          stats[pendingStat]++;
+          log(kind + '-retry', {retry: retries, maxRetries: policy.maxRetries, delayMs, status: response.statusCode, detectedBy: result.reason});
           // SSE comments keep a streaming client connected without inventing model output.
           if (stream && !res.headersSent) {
             res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-store', 'x-filter-max-retries': String(policy.maxRetries)});
-            res.write(': rate-limit retry pending\n\n');
+            res.write(': ' + kind + ' retry pending\n\n');
           }
           try { await wait(delayMs, signal); }
-          finally { stats.pendingRateLimitRetries--; }
+          finally { stats[pendingStat]--; }
           continue;
         }
-        stats.rateLimitExhausted++;
-        log('rate-limit-exhausted', {retries, status: response.statusCode});
+        stats[statPrefix + 'Exhausted']++;
+        log(kind + '-exhausted', {retries, status: response.statusCode});
       } else if (retries && response.statusCode < 400 && !result.error) {
-        stats.rateLimitRecoveries++;
-        log('rate-limit-recovered', {retries});
+        for (const kind of retriedKinds) {
+          stats[(kind === 'stream-disconnect' ? 'streamDisconnect' : 'rateLimit') + 'Recoveries']++;
+          log(kind + '-recovered', {retries});
+        }
       }
       clearInterval(heartbeat);
-      if (res.headersSent && !/text\/event-stream/i.test(String(response.headers['content-type'] || ''))) {
+      if (result.syntheticError || (res.headersSent && !/text\/event-stream/i.test(String(response.headers['content-type'] || '')))) {
         // A streamed retry already sent SSE comments; relay the final failure as
         // a real SSE error instead of mixing HTTP JSON with the event stream.
         const error = result.error || {code: 'upstream_protocol_mismatch', message: 'Upstream returned a non-stream response after retry.'};
         const value = typeof error === 'string' ? {message: error} : error;
+        if (!res.headersSent) res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-store'});
         res.end('event: error\ndata: ' + JSON.stringify({...value, type: 'error'}) + '\n\n');
         response.destroy();
+        if (result.source !== response) result.source.destroy();
       } else await pipeResponse(response, res, result, signal, cleanHeaders);
       return;
     }
   } finally { clearInterval(heartbeat); stats.activeResponsesRequests--; }
 }
 
-module.exports = {DEFAULT_POLICY, retryDelay, isRateLimit, forwardResponses};
+module.exports = {DEFAULT_POLICY, retryDelay, isRateLimit, isStreamDisconnect, forwardResponses};

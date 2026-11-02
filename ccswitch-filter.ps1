@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('Menu', 'Panel', 'StopAll', 'Start', 'Stop', 'Restart', 'Status', 'Run', 'Test')]
     [string]$Action = 'Status',

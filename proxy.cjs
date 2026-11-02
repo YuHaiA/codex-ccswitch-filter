@@ -148,7 +148,8 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
   const stats = {requests: 0, filteredRequests: 0, removedReasoningItems: 0, removedItemIds: 0, removedHostedItems: 0,
     blockedRequests: 0, upstreamErrors: 0, upstreamHttpErrors: 0, lastFilteredAt: null, lastUpstreamStatus: null,
     activeResponsesRequests: 0, rateLimitErrors: 0, rateLimitRetries: 0, rateLimitRecoveries: 0,
-    rateLimitExhausted: 0, pendingRateLimitRetries: 0};
+    rateLimitExhausted: 0, pendingRateLimitRetries: 0, streamDisconnectErrors: 0, streamDisconnectRetries: 0,
+    streamDisconnectRecoveries: 0, streamDisconnectExhausted: 0, pendingStreamDisconnectRetries: 0};
   const server = http.createServer(async (req, res) => {
     let upstreamRequest;
     const controller = new AbortController();
